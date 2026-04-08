@@ -431,3 +431,8 @@ V.I. Lenin
 
 
 </table>
+
+
+## Outlookメールの定期バックアップ
+
+Outlookバックアップ用のサンプルツールを追加しています。詳細は `OUTLOOK_BACKUP.md` を参照してください。
