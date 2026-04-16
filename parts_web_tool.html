@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>部品リスト統合ツール</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    label { font-weight: 600; min-width: 120px; }
+    input, textarea, button, select { padding: 6px 8px; }
+    input[type="text"], textarea { min-width: 360px; }
+    textarea { min-height: 90px; }
+    .panel { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+    .chip { background: #eef4ff; border: 1px solid #b8ccff; border-radius: 16px; padding: 2px 10px; font-size: 13px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+    th, td { border: 1px solid #ddd; padding: 6px; text-align: left; font-size: 13px; }
+    .muted { color: #666; font-size: 13px; }
+    .error { color: #b10000; }
+  </style>
+</head>
+<body>
+  <h1>部品リスト統合ツール（HTML版）</h1>
+
+  <div class="panel">
+    <div class="row">
+      <label for="baseUrl">取得URL</label>
+      <input id="baseUrl" type="text" value="http://egl620043.jpn.mds.honda.com/11G/3V5_WHS/#no-back" />
+    </div>
+    <div class="row">
+      <label for="userParam">ユーザーパラメータ</label>
+      <input id="userParam" type="text" value="user" />
+    </div>
+    <div class="row">
+      <label for="format">レスポンス形式</label>
+      <select id="format">
+        <option value="auto">auto</option>
+        <option value="json">json</option>
+        <option value="html">html</option>
+      </select>
+    </div>
+    <div class="row">
+      <label for="userCandidates">候補ユーザー一覧</label>
+      <textarea id="userCandidates" placeholder="例: yamada\nsuzuki\ntanaka"></textarea>
+    </div>
+    <div class="muted">※ 候補は改行またはカンマ区切りで入力。ユーザー名は不完全一致で検索できます。</div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <label for="userSearch">ユーザー選択</label>
+      <input id="userSearch" list="candidateList" type="text" placeholder="ユーザー名の一部を入力" />
+      <button id="addUserBtn">ユーザー追加</button>
+      <button id="exportBtn">CSV出力</button>
+    </div>
+    <datalist id="candidateList"></datalist>
+    <div id="selectedUsers" class="chips"></div>
+    <div id="status" class="muted"></div>
+  </div>
+
+  <div class="panel">
+    <h2>集約部品リスト</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>part_no</th>
+          <th>part_name</th>
+          <th>total_quantity</th>
+          <th>users</th>
+          <th>locations</th>
+          <th>user_quantity</th>
+        </tr>
+      </thead>
+      <tbody id="partsBody"></tbody>
+    </table>
+  </div>
+
+  <script>
+    const state = { selectedUsers: new Set(), merged: new Map(), userData: new Map(), candidates: [] };
+    const ui = {
+      baseUrl: document.getElementById('baseUrl'), userParam: document.getElementById('userParam'),
+      format: document.getElementById('format'), userCandidates: document.getElementById('userCandidates'),
+      userSearch: document.getElementById('userSearch'), candidateList: document.getElementById('candidateList'),
+      addUserBtn: document.getElementById('addUserBtn'), exportBtn: document.getElementById('exportBtn'),
+      selectedUsers: document.getElementById('selectedUsers'), partsBody: document.getElementById('partsBody'),
+      status: document.getElementById('status')
+    };
+    const alias = {
+      partNo: ['part_no', 'partno', 'part number', '品番', '部品番号'],
+      partName: ['part_name', 'name', 'description', '部品名'],
+      quantity: ['quantity', 'qty', '在庫数', '数量'],
+      location: ['location', 'shelf', 'bin', '保管場所']
+    };
+    const normalizeKey = (k) => String(k || '').toLowerCase().replace(/[^a-z0-9\u3040-\u30ff\u4e00-\u9faf]/g, '');
+    function findValue(row, keys, fallback = '') {
+      const map = new Map(Object.entries(row).map(([k, v]) => [normalizeKey(k), v]));
+      for (const key of keys) {
+        const v = map.get(normalizeKey(key));
+        if (v !== undefined && v !== null && v !== '') return v;
+      }
+      return fallback;
+    }
+    const toNumber = (v) => { const n = Number(String(v ?? '').replace(/,/g, '')); return Number.isFinite(n) ? n : 0; };
+
+    function parseCandidateInput() {
+      state.candidates = ui.userCandidates.value.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
+      refreshDatalist(ui.userSearch.value);
+    }
+    function refreshDatalist(keyword) {
+      const q = (keyword || '').trim().toLowerCase();
+      const list = q ? state.candidates.filter((x) => x.toLowerCase().includes(q)) : state.candidates;
+      ui.candidateList.innerHTML = '';
+      list.slice(0, 50).forEach((name) => {
+        const option = document.createElement('option'); option.value = name; ui.candidateList.appendChild(option);
+      });
+    }
+    function buildUrl(baseUrl, user, userParam) {
+      const url = new URL(baseUrl); url.searchParams.set(userParam, user); return url.toString();
+    }
+    function parseJsonRecords(payload) {
+      if (Array.isArray(payload)) return payload.filter((x) => x && typeof x === 'object');
+      if (payload && typeof payload === 'object') {
+        for (const k of ['items', 'parts', 'data', 'results', 'rows']) if (Array.isArray(payload[k])) return payload[k].filter((x) => x && typeof x === 'object');
+        return [payload];
+      }
+      return [];
+    }
+    function parseHtmlRecords(htmlText) {
+      const doc = new DOMParser().parseFromString(htmlText, 'text/html');
+      const table = doc.querySelector('table');
+      if (!table) return [];
+      const rows = [...table.querySelectorAll('tr')].map((tr) => [...tr.querySelectorAll('th,td')].map((td) => td.textContent.trim()));
+      if (rows.length < 2) return [];
+      const header = rows[0];
+      return rows.slice(1).map((cols) => Object.fromEntries(header.map((h, i) => [h, cols[i] ?? ''])));
+    }
+    function normalizeRecords(rows, user) {
+      return rows.map((row) => {
+        const part_no = String(findValue(row, alias.partNo, '')).trim();
+        if (!part_no) return null;
+        return { user, part_no, part_name: String(findValue(row, alias.partName, '')).trim(), quantity: toNumber(findValue(row, alias.quantity, 0)), location: String(findValue(row, alias.location, '')).trim() };
+      }).filter(Boolean);
+    }
+    async function fetchUserParts(user) {
+      const url = buildUrl(ui.baseUrl.value.trim(), user, ui.userParam.value.trim() || 'user');
+      const res = await fetch(url, { credentials: 'include' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      let rows = [];
+      if (ui.format.value === 'json' || ui.format.value === 'auto') { try { rows = parseJsonRecords(JSON.parse(text)); } catch (_) {} }
+      if (!rows.length && (ui.format.value === 'html' || ui.format.value === 'auto')) rows = parseHtmlRecords(text);
+      return normalizeRecords(rows, user);
+    }
+    function rebuildMerged() {
+      state.merged.clear();
+      for (const [user, rows] of state.userData.entries()) {
+        if (!state.selectedUsers.has(user)) continue;
+        for (const r of rows) {
+          const key = `${r.part_no}__${r.part_name}`;
+          if (!state.merged.has(key)) state.merged.set(key, { part_no: r.part_no, part_name: r.part_name, total_quantity: 0, users: new Set(), locations: new Set(), user_quantity: {} });
+          const m = state.merged.get(key);
+          m.total_quantity += r.quantity;
+          m.users.add(user);
+          if (r.location) m.locations.add(r.location);
+          m.user_quantity[user] = (m.user_quantity[user] || 0) + r.quantity;
+        }
+      }
+    }
+    const sortObject = (obj) => Object.fromEntries(Object.entries(obj).sort(([a], [b]) => a.localeCompare(b)));
+    const escapeHtml = (s) => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+    function renderSelectedUsers() {
+      ui.selectedUsers.innerHTML = '';
+      [...state.selectedUsers].sort().forEach((user) => {
+        const el = document.createElement('span'); el.className = 'chip'; el.textContent = user; ui.selectedUsers.appendChild(el);
+      });
+    }
+    function renderTable() {
+      const rows = [...state.merged.values()].sort((a, b) => a.part_no.localeCompare(b.part_no) || a.part_name.localeCompare(b.part_name));
+      ui.partsBody.innerHTML = '';
+      rows.forEach((r) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${escapeHtml(r.part_no)}</td><td>${escapeHtml(r.part_name)}</td><td>${r.total_quantity}</td><td>${escapeHtml([...r.users].sort().join(';'))}</td><td>${escapeHtml([...r.locations].sort().join(';'))}</td><td>${escapeHtml(JSON.stringify(sortObject(r.user_quantity)))}</td>`;
+        ui.partsBody.appendChild(tr);
+      });
+      ui.status.textContent = `${rows.length} 件の部品を表示中`;
+      ui.status.className = 'muted';
+    }
+    const csvEscape = (v) => /[",\n]/.test(String(v ?? '')) ? `"${String(v ?? '').replaceAll('"', '""')}"` : String(v ?? '');
+    function exportCsv() {
+      const rows = [...state.merged.values()].sort((a, b) => a.part_no.localeCompare(b.part_no) || a.part_name.localeCompare(b.part_name));
+      if (!rows.length) { ui.status.textContent = '出力対象がありません。先にユーザーを追加してください。'; ui.status.className = 'error'; return; }
+      const header = ['part_no', 'part_name', 'total_quantity', 'users', 'locations', 'user_quantity'];
+      const lines = [header.join(',')];
+      rows.forEach((r) => lines.push([
+        r.part_no, r.part_name, r.total_quantity, [...r.users].sort().join(';'), [...r.locations].sort().join(';'), JSON.stringify(sortObject(r.user_quantity))
+      ].map(csvEscape).join(',')));
+      const blob = new Blob(["\ufeff" + lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `parts_merged_${new Date().toISOString().slice(0, 10)}.csv`; a.click(); URL.revokeObjectURL(a.href);
+      ui.status.textContent = 'CSVを出力しました。'; ui.status.className = 'muted';
+    }
+    async function addUser() {
+      const keyword = ui.userSearch.value.trim(); if (!keyword) return;
+      const candidate = state.candidates.find((x) => x.toLowerCase().includes(keyword.toLowerCase())) || keyword;
+      if (state.selectedUsers.has(candidate)) { ui.status.textContent = `${candidate} は既に追加済みです。`; ui.status.className = 'muted'; return; }
+      ui.status.textContent = `${candidate} の部品情報を取得中...`; ui.status.className = 'muted';
+      try {
+        const rows = await fetchUserParts(candidate);
+        state.userData.set(candidate, rows); state.selectedUsers.add(candidate);
+        rebuildMerged(); renderSelectedUsers(); renderTable();
+        ui.status.textContent = `${candidate} を追加（${rows.length}件）しました。`;
+      } catch (e) {
+        ui.status.textContent = `${candidate} の取得に失敗しました: ${e.message}`; ui.status.className = 'error';
+      }
+    }
+    ui.userCandidates.addEventListener('input', parseCandidateInput);
+    ui.userSearch.addEventListener('input', (e) => refreshDatalist(e.target.value));
+    ui.addUserBtn.addEventListener('click', addUser);
+    ui.exportBtn.addEventListener('click', exportCsv);
+    parseCandidateInput();
+  </script>
+</body>
+</html>
